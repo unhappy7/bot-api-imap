@@ -154,7 +154,7 @@ def process_mailbox():
             sender = f"{name} <{addr}>" if name else addr
             send_to_telegram(f"📧 {sender}\nТема: {subject}\n\n{body}")
 
-            # Сохраняем после каждого письма, чтобы не терять прогресс при сбое
+        
             save_last_uid(uid)
             print(f"The UID message has been forwarded {uid}: {subject}")
 
