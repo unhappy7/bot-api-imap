@@ -1,10 +1,9 @@
-
-
 import email
 import imaplib
 import json
 import os
 import re
+import sys
 import time
 from email.header import decode_header, make_header
 from email.utils import parseaddr
@@ -17,13 +16,21 @@ try:
 
     load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 except ImportError:
-    pass  
+    pass
+
+
+def require(name):
+    value = os.environ.get(name, "").strip()
+    if not value:
+        sys.exit(f"Error: environment variable {name} is not set (check your .env file).")
+    return value
+
 
 IMAP_HOST = os.getenv("IMAP_HOST", "imap.gmail.com")
-IMAP_USER = os.environ["IMAP_USER"]
-IMAP_PASSWORD = os.environ["IMAP_PASSWORD"]
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-CHAT_IDS = [c.strip() for c in os.environ["CHAT_ID"].split(",") if c.strip()]
+IMAP_USER = require("IMAP_USER")
+IMAP_PASSWORD = require("IMAP_PASSWORD")
+BOT_TOKEN = require("BOT_TOKEN")
+CHAT_IDS = [c.strip() for c in require("CHAT_ID").split(",") if c.strip()]
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))
 MAX_BODY_CHARS = int(os.getenv("MAX_BODY_CHARS", "1000"))
 ALLOWED_SENDERS = [
@@ -32,17 +39,26 @@ ALLOWED_SENDERS = [
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
 
 
-def load_last_uid():
+def log(message):
+    print(message, flush=True)
+
+
+def redact(text):
+    """Never let the bot token end up in logs."""
+    return str(text).replace(BOT_TOKEN, "***")
+
+
+def load_state():
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f).get("last_uid")
+            return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
-        return None
+        return {}
 
 
-def save_last_uid(uid):
+def save_state(last_uid, uidvalidity):
     with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump({"last_uid": uid}, f)
+        json.dump({"last_uid": last_uid, "uidvalidity": uidvalidity}, f)
 
 
 def decode_str(value):
@@ -91,8 +107,6 @@ def get_body(msg):
 
 
 def send_to_telegram(text):
-
-
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     delivered = 0
     for chat_id in CHAT_IDS:
@@ -109,23 +123,39 @@ def send_to_telegram(text):
             resp.raise_for_status()
             delivered += 1
         except Exception as e:
-            print(f"Couldn't send to {chat_id}: {e}")
+            log(f"Couldn't send to {chat_id}: {redact(e)}")
     if delivered == 0:
         raise RuntimeError("The message was not delivered to any recipient.")
 
 
+def get_uidvalidity(imap):
+    _, data = imap.response("UIDVALIDITY")
+    try:
+        return int(data[0])
+    except (TypeError, ValueError, IndexError):
+        return None
+
+
 def process_mailbox():
-    last_uid = load_last_uid()
+    state = load_state()
+    last_uid = state.get("last_uid")
 
     with imaplib.IMAP4_SSL(IMAP_HOST) as imap:
         imap.login(IMAP_USER, IMAP_PASSWORD)
-        imap.select("INBOX", readonly=True)
+        status, _ = imap.select("INBOX", readonly=True)
+        if status != "OK":
+            raise RuntimeError("Could not open INBOX.")
+        uidvalidity = get_uidvalidity(imap)
+
+        if last_uid is not None and state.get("uidvalidity") not in (None, uidvalidity):
+            log("UIDVALIDITY changed: resetting state, old emails are skipped.")
+            last_uid = None
 
         if last_uid is None:
             status, data = imap.uid("SEARCH", None, "ALL")
             uids = [int(u) for u in data[0].split()] if status == "OK" and data[0] else []
-            save_last_uid(max(uids) if uids else 0)
-            print("First launch: old emails are skipped.")
+            save_state(max(uids) if uids else 0, uidvalidity)
+            log("First launch: old emails are skipped.")
             return
 
         status, data = imap.uid("SEARCH", None, f"UID {last_uid + 1}:*")
@@ -137,14 +167,17 @@ def process_mailbox():
         for uid in new_uids:
             status, msg_data = imap.uid("FETCH", str(uid), "(BODY.PEEK[])")
             if status != "OK" or not msg_data or not msg_data[0]:
-                continue
+             
+                log(f"Could not fetch UID {uid}, will retry.")
+                break
 
             msg = email.message_from_bytes(msg_data[0][1])
-            name, addr = parseaddr(decode_str(msg.get("From", "")))
-            subject = decode_str(msg.get("Subject", "")) or "(no theme)"
+            name, addr = parseaddr(msg.get("From", ""))
+            name = decode_str(name)
+            subject = decode_str(msg.get("Subject", "")) or "(no subject)"
 
             if ALLOWED_SENDERS and addr.lower() not in ALLOWED_SENDERS:
-                save_last_uid(uid)
+                save_state(uid, uidvalidity)
                 continue
 
             body = get_body(msg)
@@ -154,19 +187,20 @@ def process_mailbox():
             sender = f"{name} <{addr}>" if name else addr
             send_to_telegram(f"📧 {sender}\nТема: {subject}\n\n{body}")
 
-        
-            save_last_uid(uid)
-            print(f"The UID message has been forwarded {uid}: {subject}")
+            save_state(uid, uidvalidity)
+            log(f"Forwarded UID {uid}: {subject}")
 
 
 def main():
-    print(f"I keep an eye on {IMAP_USER} on {IMAP_HOST}, interval {CHECK_INTERVAL} , "
-          f"recipients: {len(CHAT_IDS)}")
+    log(
+        f"Watching {IMAP_USER} on {IMAP_HOST}, interval {CHECK_INTERVAL}s, "
+        f"recipients: {len(CHAT_IDS)}"
+    )
     while True:
         try:
             process_mailbox()
         except Exception as e:
-            print(f"Error: {e}")
+            log(f"Error: {redact(e)}")
         time.sleep(CHECK_INTERVAL)
 
 
